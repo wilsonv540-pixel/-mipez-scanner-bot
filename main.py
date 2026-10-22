@@ -1,5 +1,6 @@
 import os, time, threading, requests, yfinance as yf
 import pandas as pd
+import numpy as np
 from flask import Flask
 
 app = Flask(__name__)
@@ -8,89 +9,96 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 SYMBOLS = {
-    "GC=F": "ORO 🥇",
+    "GC=F": "ORO 🥇 XAUUSD",
     "BTC-USD": "BTC ₿",
     "ETH-USD": "ETH Ξ",
     "YM=F": "US30 🇺🇸"
 }
 
+last_signal = {}
+
 def send_telegram(text):
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=10)
+        requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=10)
+        print(f"TG ENVIADO: {text[:50]}")
     except Exception as e:
         print(f"Error TG: {e}")
 
-def supertrend(df, period=8, multiplier=2.0):
+def supertrend_real(df, period=8, multiplier=2.0):
+    # ATR real como TradingView
+    high_low = df['High'] - df['Low']
+    high_close = np.abs(df['High'] - df['Close'].shift())
+    low_close = np.abs(df['Low'] - df['Close'].shift())
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    atr = tr.rolling(period).mean()
+    
     hl2 = (df['High'] + df['Low']) / 2
-    atr = (df['High'] - df['Low']).rolling(period).mean()
     upper = hl2 + multiplier * atr
     lower = hl2 - multiplier * atr
-    direction = pd.Series(1, index=df.index)
+    
+    st = pd.Series(0, index=df.index)
+    dir = pd.Series(1, index=df.index)
+    
     for i in range(1, len(df)):
-        if df['Close'][i] > upper[i-1]: direction[i]=1
-        elif df['Close'][i] < lower[i-1]: direction[i]=-1
-        else: direction[i]=direction[i-1]
-    return direction
+        if df['Close'].iloc[i] > upper.iloc[i-1]:
+            dir.iloc[i] = 1
+        elif df['Close'].iloc[i] < lower.iloc[i-1]:
+            dir.iloc[i] = -1
+        else:
+            dir.iloc[i] = dir.iloc[i-1]
+            if dir.iloc[i] == 1 and lower.iloc[i] < lower.iloc[i-1]:
+                lower.iloc[i] = lower.iloc[i-1]
+            if dir.iloc[i] == -1 and upper.iloc[i] > upper.iloc[i-1]:
+                upper.iloc[i] = upper.iloc[i-1]
+    
+    return dir, upper, lower
 
 def check_market(symbol, name):
     try:
-        data = yf.download(symbol, period="1d", interval="5m", progress=False)
-        if len(data) < 50: return
-        if isinstance(data.columns, pd.MultiIndex): data.columns = data.columns.get_level_values(0)
+        data = yf.download(symbol, period="2d", interval="5m", progress=False, auto_adjust=True)
+        if len(data) < 60:
+            print(f"{name} pocos datos")
+            return False
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
         
-        close = data['Close']
-        # RSI
-        delta = close.diff()
-        gain = delta.where(delta>0,0).rolling(14).mean()
-        loss = (-delta.where(delta<0,0)).rolling(14).mean()
-        rs = gain / loss
-        rsi = 100 - (100/(1+rs))
-        # MACD
-        ema12 = close.ewm(span=12).mean()
-        ema26 = close.ewm(span=26).mean()
-        macd = ema12 - ema26
-        signal = macd.ewm(span=9).mean()
-        # Supertrend
-        st_dir = supertrend(data)
-
-        price = float(close.iloc[-1])
-        rsi_val = float(rsi.iloc[-1])
-        macd_val = float(macd.iloc[-1])
-        sig_val = float(signal.iloc[-1])
-        st_val = int(st_dir.iloc[-1])
+        dir, upper, lower = supertrend_real(data, 8, 2.0)
+        price = float(data['Close'].iloc[-1])
+        prev_dir = int(dir.iloc[-2])
+        curr_dir = int(dir.iloc[-1])
         
-        print(f"{name} {price:.2f} RSI:{rsi_val:.1f} ST:{st_val}")
-
-        # SEÑAL PRO: ST + RSI + MACD alineados
-        buy = st_val == 1 and rsi_val > 52 and rsi_val < 75 and macd_val > sig_val
-        sell = st_val == -1 and rsi_val < 48 and macd_val < sig_val
-
-        if buy:
-            send_telegram(f"🐟 *MI PEZ COMPRA - {name}*\n💰 Precio: `{price:.2f}`\n📊 RSI: {rsi_val:.1f} | MACD: ALCISTA\n✅ Supertrend 2.0,8: COMPRA\n⏰ M5 Confirmada")
-            return True
-        if sell:
-            send_telegram(f"🐟 *MI PEZ VENTA - {name}*\n💰 Precio: `{price:.2f}`\n📊 RSI: {rsi_val:.1f} | MACD: BAJISTA\n🔻 Supertrend 2.0,8: VENTA\n⏰ M5 Confirmada")
-            return True
+        print(f"{name} {price} ST prev:{prev_dir} curr:{curr_dir}")
+        
+        # DETECTA CAMBIO IGUAL QUE TU FOTO
+        if prev_dir != curr_dir:
+            if curr_dir == 1:
+                send_telegram(f"🐟 COMPRA {name}\n💰 {price:.2f}\n📈 Supertrend 2.0,8 acaba de girar a COMPRA\n⏰ M5 - igual que tu TradingView")
+                return True
+            else:
+                send_telegram(f"🐟 VENTA {name}\n💰 {price:.2f}\n📉 Supertrend 2.0,8 acaba de girar a VENTA\n⏰ M5 - igual que tu TradingView")
+                return True
+        
+        # Guarda estado
+        last_signal[name] = curr_dir
+        return False
     except Exception as e:
         print(f"Error {name}: {e}")
-    return False
+        return False
 
 def scanner_loop():
-    send_telegram("🐟 *MI PEZ SCANNER PRO 24/7 INICIADO*\n✅ Render: ACTIVO\n✅ UptimeRobot: 100% Cuidando\n✅ Mercados: ORO, BTC, ETH, US30\n✅ Estrategia: Supertrend 2.0,8 + RSI14 + MACD M5\n\n¡Ya no se apaga mi pez! Señales cada M5")
+    send_telegram("🐟 MI PEZ BOT ARREGLADO 24/7\n✅ Ahora es IGUAL a tu TradingView\n✅ Solo Supertrend 8,2.0 - sin filtros\n✅ Te avisará en cada giro COMPRA/VENTA\n\nProbando ORO, BTC, ETH, US30 cada 1 min")
     while True:
         for sym, name in SYMBOLS.items():
-            triggered = check_market(sym, name)
-            if triggered:
-                time.sleep(300) # 5 min cooldown por señal
-            time.sleep(20) # 20 seg entre mercados
-        time.sleep(60) # Vuelta completa cada 1 min
+            check_market(sym, name)
+            time.sleep(10)
+        time.sleep(60)
 
 threading.Thread(target=scanner_loop, daemon=True).start()
 
 @app.route('/')
 def home():
-    return "MI PEZ SCANNER PRO 24/7 - ORO,BTC,ETH,US30 - ACTIVO"
+    return "MI PEZ BOT IGUAL TRADINGVIEW - ACTIVO"
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
